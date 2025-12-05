@@ -3,3 +3,4 @@
 .vscode
 *.DS_Store
 .ipynb_checkpoints
+megatron_ckpt/
