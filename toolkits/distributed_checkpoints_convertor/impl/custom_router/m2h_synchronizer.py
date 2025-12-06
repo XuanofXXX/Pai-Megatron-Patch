@@ -65,7 +65,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
 
     def _copy_impl(self, src_tensor, dst_tensor, param_type: ParamType=ParamType.UNIQUE):
         param_id = self._hf_params_to_id[dst_tensor]
-        if param_type in [ParamType.MOE_COLUMN, ParamType.MOE_ROW, ParamType.MOE_GATE_UP, ParamType.MOE_DOWN]:
+        if param_type in [ParamType.MOE_COLUMN, ParamType.MOE_ROW, ParamType.MOE_GATE_UP, ParamType.MOE_DOWN, ParamType.MOE_EXPERT]:
             # NOTE: only register on edp_rank 0
             if self.edp_rank != 0:
                 return
@@ -315,12 +315,14 @@ class MG2HFSynchronizer(BaseSynchronizer):
             # 按 HF ID 排序，确保拼接顺序是 0, 1, 2...
             # 虽然 EP 通常是连续的，但排序更稳妥
             sorted_mg_ids = sorted(ep_mapping.keys(), key=lambda k: ep_mapping[k])
+            # print(f"[Debug] Local MG Expert IDs sorted by HF Expert IDs: {sorted_mg_ids}")
             
             for mg_expert_id in sorted_mg_ids:
                 # --- A. 提取 Expert 的 FC1 权重 ---
                 if self.args.moe_grouped_gemm:
                     # TE GroupedGEMM: 权重分散在 weight0, weight1...
                     fc1_weight = getattr(moe.experts.linear_fc1, f'weight{mg_expert_id}')
+                    # print(f"[Debug] Using GroupedGEMM weight for Expert {mg_expert_id}, shape: {fc1_weight.shape}")
                 else:
                     # Sequential: 权重在 local_experts 列表中
                     fc1_weight = moe.experts.local_experts[mg_expert_id].linear_fc1.weight
@@ -340,9 +342,11 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 
                 # 确保类型一致
                 probe = probe.to(gate_proj_weight.dtype)
+                probe = probe.to(gate_proj_weight.device)
                 
                 # einsum: 'f' (ffn_dim), 'fh' (ffn_dim, hidden_dim) -> 'h' (hidden_dim)
                 fused_row = torch.einsum('f, fh -> h', probe, gate_proj_weight)
+                # print(f"[Debug] Fused Gate Row for Expert {mg_expert_id}, shape: {fused_row.shape}")
                 
                 local_fused_gates.append(fused_row)
             
@@ -358,7 +362,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
             # 使用 ParamType.COLUMN，意味着 Synchronizer 会沿着 Dim 0 (Experts 维度) 
             # 把所有 Rank 的 local_fused_tensor 拼起来。
             # 最终 hf_moe.gate.weight 形状: [Total_Experts, Hidden_Size]
-            self.copy(local_fused_tensor, hf_moe.gate.weight, param_type=ParamType.COLUMN)
+            self.copy(local_fused_tensor, hf_moe.gate.weight, param_type=ParamType.MOE_EXPERT)
         else:
             self.copy(moe.router.weight, hf_moe.gate.weight)
             if moe.router.enable_expert_bias:
@@ -498,6 +502,8 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 if param_type == ParamType.NULL:
                     raise ValueError(f"ParamType.NULL found on {key}.")
                 try:
+                    if param_type == ParamType.MOE_EXPERT:
+                        print(f"[Iters {bucket_idx} RANK {self.rank}] Merging param {key} with type {param_type.name}. param_id={param_id}, data from ranks: {list(data_dict.keys())}")
                     data[param_id] = self._merge_data(param_type, data_dict)
                 except ParamMergeError as e:
                     raise ValueError(f"Merge Error on key {key}: {e}")
@@ -729,7 +735,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
                     raise ParamMergeError("Unexpected expert parameter data from multiple ep ranks")
 
             if is_expert:
-                tensors = deduplicate_and_sort(tensor_dict, 2)
+                tensors = deduplicate_and_sort(tensor_dict, 3)
             else:
                 tensors = deduplicate_and_sort(tensor_dict, 0)
             return torch.cat(tensors, dim=axis)
@@ -779,6 +785,20 @@ class MG2HFSynchronizer(BaseSynchronizer):
             res = torch.cat([item[1] for item in sorted(etp_tensors.items())], dim=1)
             return res.permute(0, 2, 1).contiguous()
 
+        def merge_moe_expert_tensor(tensor_dict):
+            global_ranks = torch.tensor(list(tensor_dict.keys()), dtype=torch.long, device=self.device) # (N, )
+            ranks = self._rank_mapping.index_select(0, global_ranks) # (N, 6)
+            # print(f"[Debug] Merging MOE Expert Tensor from ranks: {global_ranks.tolist()} with mapping ranks: {ranks.tolist()}")
+            if self.debug:
+                if ranks[:, 5].any():
+                    raise ParamMergeError("Unexpected expert parameter data from non-zero expert dp rank")
+                if ranks[:, 3].max() != ranks[:, 3].min():
+                    raise ParamMergeError("Unexpected expert parameter data from multiple ep ranks")
+
+            # print(f"[Debug] tensor_dict: {tensor_dict.keys()}, shape: {tensor_dict[0].shape} ")
+            tensors = deduplicate_and_sort(tensor_dict, 3)
+            return torch.cat(tensors, dim=0)
+
         merge_func_mapping = {
             ParamType.MOE_COLUMN: partial(merge_along_axis, 0, is_expert=True),
             ParamType.MOE_ROW: partial(merge_along_axis, 1, is_expert=True),
@@ -789,6 +809,7 @@ class MG2HFSynchronizer(BaseSynchronizer):
             ParamType.UNIQUE: no_merge_func,
             ParamType.QGKV_W: partial(merge_qgkv, False),
             ParamType.MOE_GATE_UP: merge_moe_gate_up_tensor,
-            ParamType.MOE_DOWN: merge_moe_down_tensor
+            ParamType.MOE_DOWN: merge_moe_down_tensor,
+            ParamType.MOE_EXPERT: merge_moe_expert_tensor
         }
         return merge_func_mapping[merge_type](tensor_dict)

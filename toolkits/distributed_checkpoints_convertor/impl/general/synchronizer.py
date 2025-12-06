@@ -43,6 +43,7 @@ class ParamType(Enum):
     MERGED_LINEAR = 10
     QGKV_W = 11
     MOE_DOWN = 12
+    MOE_EXPERT = 13
 
 class BaseSynchronizer(ABC):
     def __init__(
