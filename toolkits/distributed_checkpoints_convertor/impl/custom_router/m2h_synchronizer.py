@@ -304,10 +304,68 @@ class MG2HFSynchronizer(BaseSynchronizer):
 
     def set_moe_layer_state(self, moe, hf_moe):
         # router
-        # self.copy(moe.router.weight, hf_moe.gate.weight)
-        # if moe.router.enable_expert_bias:
-        #     self.copy(moe.router.expert_bias, hf_moe.gate.e_score_correction_bias)
-        self.copy(moe.router.probe_vector, hf_moe.probe_vector.weight)
+        if hasattr(moe.router, 'probe_vector'):
+            probe = moe.router.probe_vector
+            local_fused_gates = []
+            # 2. 遍历本地所有的 Expert，计算它们对应的 Gate Row
+            # 我们复用 _build_expert_parallel_mapping 来确保顺序正确
+            # Mapping 格式: {mg_expert_id: hf_expert_id}
+            ep_mapping = self._build_expert_parallel_mapping()
+            
+            # 按 HF ID 排序，确保拼接顺序是 0, 1, 2...
+            # 虽然 EP 通常是连续的，但排序更稳妥
+            sorted_mg_ids = sorted(ep_mapping.keys(), key=lambda k: ep_mapping[k])
+            
+            for mg_expert_id in sorted_mg_ids:
+                # --- A. 提取 Expert 的 FC1 权重 ---
+                if self.args.moe_grouped_gemm:
+                    # TE GroupedGEMM: 权重分散在 weight0, weight1...
+                    fc1_weight = getattr(moe.experts.linear_fc1, f'weight{mg_expert_id}')
+                else:
+                    # Sequential: 权重在 local_experts 列表中
+                    fc1_weight = moe.experts.local_experts[mg_expert_id].linear_fc1.weight
+                
+                # --- B. 切分出 Gate Proj 部分 (处理 SwiGLU) ---
+                # Megatron FC1 Shape: [2 * FFN_Hidden, Hidden_Size] (通常 Gate 在前)
+                hidden_size = fc1_weight.shape[-1]
+                # reshape 分离 Gate 和 Up
+                # 假设 SwiGLU: [Gate, Up]
+                gate_proj_weight, _ = fc1_weight.reshape(2, -1, hidden_size)
+                
+                # --- C. 执行熔合计算 ---
+                # Probe: [FFN]
+                # Expert Gate: [FFN, Hidden]
+                # Fused Row: [Hidden]  (相当于 1 * Hidden)
+                # 计算逻辑: Row = Probe @ Expert_Gate
+                
+                # 确保类型一致
+                probe = probe.to(gate_proj_weight.dtype)
+                
+                # einsum: 'f' (ffn_dim), 'fh' (ffn_dim, hidden_dim) -> 'h' (hidden_dim)
+                fused_row = torch.einsum('f, fh -> h', probe, gate_proj_weight)
+                
+                local_fused_gates.append(fused_row)
+            
+            # 3. 堆叠本地结果
+            # Shape: [Num_Local_Experts, Hidden_Size]
+            if local_fused_gates:
+                local_fused_tensor = torch.stack(local_fused_gates, dim=0)
+            else:
+                # 极端情况：某些 Rank 可能没有 Expert (通常 EP 不会这样，但防万一)
+                local_fused_tensor = torch.empty(0, probe.shape[0], device=self.device)
+
+            # 4. 注册复制
+            # 使用 ParamType.COLUMN，意味着 Synchronizer 会沿着 Dim 0 (Experts 维度) 
+            # 把所有 Rank 的 local_fused_tensor 拼起来。
+            # 最终 hf_moe.gate.weight 形状: [Total_Experts, Hidden_Size]
+            self.copy(local_fused_tensor, hf_moe.gate.weight, param_type=ParamType.COLUMN)
+        else:
+            self.copy(moe.router.weight, hf_moe.gate.weight)
+            if moe.router.enable_expert_bias:
+                self.copy(moe.router.expert_bias, hf_moe.gate.e_score_correction_bias)
+
+        # self.copy(moe.router.probe_vector, hf_moe.probe_vector)
+        
         # experts
         if self.args.moe_grouped_gemm:
             # group gemm
