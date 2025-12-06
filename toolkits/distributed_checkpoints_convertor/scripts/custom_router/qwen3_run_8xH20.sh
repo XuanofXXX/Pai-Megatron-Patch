@@ -14,7 +14,21 @@ export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true # for PyTorch >= 2.6
 
 NUM_NODES=${WORLD_SIZE:-1}
 NODE_RANK=${RANK:-0}
-GPUS_PER_NODE=${KUBERNETES_CONTAINER_RESOURCE_GPU:-8}
+
+if command -v nvidia-smi &>/dev/null; then
+    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+        # 如果限制了可见 GPU，就按可见的来数
+        IFS=',' read -ra devs<<<"$CUDA_VISIBLE_DEVICES"
+        GPUS_PER_NODE=${#devs[@]}
+    else
+        # 否则数整机上 nvidia-smi 能看到的 GPU 数量
+        GPUS_PER_NODE=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    fi
+else
+    # 没有 nvidia-smi 时的兜底
+    GPUS_PER_NODE=${KUBERNETES_CONTAINER_RESOURCE_GPU:-8}
+fi
+
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 
@@ -211,7 +225,7 @@ elif [ $MODEL_SIZE = A3B ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
             --pipeline-model-parallel-size 1
-            --expert-model-parallel-size 8
+            --expert-model-parallel-size 2
         )
     fi
 elif [ $MODEL_SIZE = A22B ]; then
