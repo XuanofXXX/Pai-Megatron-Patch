@@ -2,7 +2,7 @@
 set -e
 CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 CONVERTOR_DIR=$( dirname $( dirname ${CURRENT_DIR}))
-# MEGATRON_PATCH_PATH=$( dirname $( dirname ${CONVERTOR_DIR}))
+MEGATRON_PATCH_PATH=$( dirname $( dirname ${CONVERTOR_DIR}))
 # export PYTHONPATH=${MEGATRON_PATCH_PATH}:${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250624:${CONVERTOR_DIR}/impl:$PYTHONPATH
 # INFO 这里改了Megatron Path
 MEGATRON_PATH="/workspace/xcx/YuLan-Pretrain"
@@ -224,8 +224,8 @@ elif [ $MODEL_SIZE = A3B ]; then
     if [ -z  "$MODEL_PARALLEL_ARGS" ]; then
         MODEL_PARALLEL_ARGS=(
             --tensor-model-parallel-size 1
-            --pipeline-model-parallel-size 1
-            --expert-model-parallel-size 2
+            --pipeline-model-parallel-size 2
+            --expert-model-parallel-size 1
         )
     fi
 elif [ $MODEL_SIZE = A22B ]; then
@@ -273,6 +273,13 @@ CONVERT_ARGS=(
     --synchronizer custom_router
 )
 
+
+LOG_DIR="$MEGATRON_PATCH_PATH/logs/convert_ckpt/"
+mkdir -p $LOG_DIR
+
+LOG_FILE="$LOG_DIR/$(date +%Y%m%d_%H%M%S).log"
+echo "Logging to $LOG_FILE"
+
 cmd="torchrun ${DISTRIBUTED_ARGS[@]} impl/convert.py \
     ${GPT_MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
@@ -282,7 +289,7 @@ cmd="torchrun ${DISTRIBUTED_ARGS[@]} impl/convert.py \
     ${OTHER_ARGS[@]}"
 
 echo $cmd
-eval $cmd
+eval $cmd 2>&1 | tee $LOG_FILE
 
 # bash scripts/custom_router/qwen3_run_8xH20.sh \
 # A3B \

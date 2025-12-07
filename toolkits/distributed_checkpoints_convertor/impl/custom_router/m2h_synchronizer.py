@@ -62,6 +62,10 @@ class MG2HFSynchronizer(BaseSynchronizer):
         except:
             self._merge_type = None
         self._has_param: torch.Tensor = None # self._has_param[param_id].nonzero() ==> ranks that have this param
+        if self.rank == 0:
+            print("DEBUG Rank Mapping (TP, PP, ETP, EP, DP, EDP):")
+            print(self._rank_mapping)
+            
 
     def _copy_impl(self, src_tensor, dst_tensor, param_type: ParamType=ParamType.UNIQUE):
         param_id = self._hf_params_to_id[dst_tensor]
@@ -306,18 +310,19 @@ class MG2HFSynchronizer(BaseSynchronizer):
         # router
         if hasattr(moe.router, 'probe_vector'):
             probe = moe.router.probe_vector
-            local_fused_gates = []
             # 2. 遍历本地所有的 Expert，计算它们对应的 Gate Row
             # 我们复用 _build_expert_parallel_mapping 来确保顺序正确
             # Mapping 格式: {mg_expert_id: hf_expert_id}
             ep_mapping = self._build_expert_parallel_mapping()
             
+            local_fused_gates = [None] * len(ep_mapping)
             # 按 HF ID 排序，确保拼接顺序是 0, 1, 2...
             # 虽然 EP 通常是连续的，但排序更稳妥
-            sorted_mg_ids = sorted(ep_mapping.keys(), key=lambda k: ep_mapping[k])
+            # sorted_mg_ids = sorted(ep_mapping.keys(), key=lambda k: ep_mapping[k])
             # print(f"[Debug] Local MG Expert IDs sorted by HF Expert IDs: {sorted_mg_ids}")
+            print(f"[Debug] ep_mapping: {ep_mapping}")
             
-            for mg_expert_id in sorted_mg_ids:
+            for mg_expert_id, hf_expert_id in ep_mapping.items():
                 # --- A. 提取 Expert 的 FC1 权重 ---
                 if self.args.moe_grouped_gemm:
                     # TE GroupedGEMM: 权重分散在 weight0, weight1...
@@ -345,15 +350,17 @@ class MG2HFSynchronizer(BaseSynchronizer):
                 probe = probe.to(gate_proj_weight.device)
                 
                 # einsum: 'f' (ffn_dim), 'fh' (ffn_dim, hidden_dim) -> 'h' (hidden_dim)
+                # print(f"[debug] probe shape: {probe.shape}, gate_proj_weight shape: {gate_proj_weight.shape}")
                 fused_row = torch.einsum('f, fh -> h', probe, gate_proj_weight)
                 # print(f"[Debug] Fused Gate Row for Expert {mg_expert_id}, shape: {fused_row.shape}")
-                
-                local_fused_gates.append(fused_row)
+
+                local_fused_gates[hf_expert_id] = fused_row
             
             # 3. 堆叠本地结果
             # Shape: [Num_Local_Experts, Hidden_Size]
             if local_fused_gates:
                 local_fused_tensor = torch.stack(local_fused_gates, dim=0)
+                # print(f"[debug] stack local fused tensor shape: {local_fused_tensor.shape}")
             else:
                 # 极端情况：某些 Rank 可能没有 Expert (通常 EP 不会这样，但防万一)
                 local_fused_tensor = torch.empty(0, probe.shape[0], device=self.device)
@@ -788,15 +795,16 @@ class MG2HFSynchronizer(BaseSynchronizer):
         def merge_moe_expert_tensor(tensor_dict):
             global_ranks = torch.tensor(list(tensor_dict.keys()), dtype=torch.long, device=self.device) # (N, )
             ranks = self._rank_mapping.index_select(0, global_ranks) # (N, 6)
-            # print(f"[Debug] Merging MOE Expert Tensor from ranks: {global_ranks.tolist()} with mapping ranks: {ranks.tolist()}")
+            print(f"[Debug] Merging MOE Expert Tensor from ranks: {global_ranks.tolist()} with mapping ranks: {ranks.tolist()}")
             if self.debug:
                 if ranks[:, 5].any():
                     raise ParamMergeError("Unexpected expert parameter data from non-zero expert dp rank")
                 if ranks[:, 3].max() != ranks[:, 3].min():
                     raise ParamMergeError("Unexpected expert parameter data from multiple ep ranks")
 
-            # print(f"[Debug] tensor_dict: {tensor_dict.keys()}, shape: {tensor_dict[0].shape} ")
+            print(f"[Debug] tensor_dict: {tensor_dict.keys()}, shape: {list(tensor_dict.values())[0].shape} ")
             tensors = deduplicate_and_sort(tensor_dict, 3)
+            print(f'[Debug] Merged MOE Expert Tensor shape: {tensors[0].shape} from {len(tensors)} local tensors.')
             return torch.cat(tensors, dim=0)
 
         merge_func_mapping = {
