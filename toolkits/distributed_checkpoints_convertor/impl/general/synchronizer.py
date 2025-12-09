@@ -73,8 +73,12 @@ class BaseSynchronizer(ABC):
         post_process = True if self.pp_rank == self.pp_size - 1 else False
         if model_provider_func is None:
             # NOTE: try to import default model provider
-            from pretrain_gpt import model_provider
-            model_provider_func = model_provider
+            # from pretrain_gpt import model_provider
+            # model_provider_func = model_provider
+            
+            from model_provider import model_provider
+            from gpt_builders import gpt_builder
+            model_provider_func = partial(model_provider, gpt_builder)
         self._mgmodel = model_provider_func(pre_process, post_process)
 
         if skip_hf_initialization:
